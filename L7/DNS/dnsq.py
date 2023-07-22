@@ -1,3 +1,4 @@
+from email.policy import default
 import io
 import enum
 import socket
@@ -27,7 +28,7 @@ def decode_labeled_str(buf: io.BytesIO) -> str:
             offset = label[0] & 0b0011_1111 << 8 | buf.read(1)[0]
             old_pos = buf.tell()
             buf.seek(offset)
-            result = decode_labeled_str(buf)
+            result += decode_labeled_str(buf)
             buf.seek(old_pos)
             return result
 
@@ -218,13 +219,13 @@ class DNSResourceRecord:
     CLASS: DNSResourceClass
     TTL: int
     RDLENGTH: int
-    RDATA: bytes
+    RDATA: str
 
     @classmethod
     def parse(cls, buf: io.BytesIO) -> DNSQuestionRecord:
         name = decode_labeled_str(buf)
         t, c, ttl, rdlen = struct.unpack('>HHIH', buf.read(10))
-        rdata = buf.read(rdlen)
+        rdata = cls.parse_rdata(DNSResourceType(t), rdlen, buf)
 
         return cls(
             NAME=name,
@@ -237,13 +238,48 @@ class DNSResourceRecord:
 
     def pack(self) -> bytes:
         raise NotImplementedError()
+    
+    @classmethod
+    def parse_rdata(cls, type_: DNSResourceType, rdlen: int, buf: io.BytesIO):
+        def as_ipv4():
+            return ".".join(map(str, struct.unpack(">BBBB", buf.read(4))))
+        
+        def as_labeled_str():
+            return decode_labeled_str(buf)
+        
+        def as_mx():
+            preference = struct.unpack(">H", buf.read(2))[0]
+            name = as_labeled_str()
+
+            return f"{name} (PREF: {preference})"
+        
+        def as_txt():
+            return buf.read().decode()
+        
+        def as_soa():
+            mname = as_labeled_str()
+            rname = as_labeled_str()
+            serial, refresh, retry, expire = struct.unpack(">4I", buf.read(4 * 4))
+
+            return f"{mname} / {rname} (serial: {serial}, refresh: {refresh}, retry: {retry}, expire: {expire})"
+
+        match type_:
+            case DNSResourceType.A:
+                if rdlen == 4:
+                   return as_ipv4()
+            case DNSResourceType.NS | DNSResourceType.PTR:
+                return as_labeled_str()
+            case DNSResourceType.SOA:
+                return as_soa()
+            case DNSResourceType.MX:
+                return as_mx()
+            case DNSResourceType.TXT:
+                return as_txt()
+
+        return buf.read(rdlen)
 
     def __repr__(self):
-        rdata = self.RDATA
-        if self.RDLENGTH == 4:
-            rdata = ".".join(map(str, struct.unpack(">BBBB", self.RDATA)))
-
-        return f"TTL: {self.TTL} | {self.NAME} {self.TYPE.name} {self.CLASS.name} {rdata}"
+        return f"TTL: {self.TTL} | {self.NAME} {self.TYPE.name} {self.CLASS.name} {self.RDATA}"
 
 
 @dataclass
@@ -256,6 +292,9 @@ class DNSPacket:
 
     @classmethod
     def query(cls, type_: DNSResourceType, name: str, reverse=False, recurse=True):
+        if type_ == DNSResourceType.PTR and "in-addr.arpa" not in name:
+            name = ".".join(reversed(name.split("."))) + ".in-addr.arpa"
+
         return cls(
             header=DNSPacketHeader(
                 IDENT=0xF149,
@@ -364,3 +403,4 @@ if __name__ == "__main__":
 
     received = DNSPacket.parse(io.BytesIO(data))
     print(received)
+    
